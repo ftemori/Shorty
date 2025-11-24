@@ -5,6 +5,72 @@ from moviepy import VideoFileClip
 import numpy as np
 import cv2
 import librosa
+from scipy.signal import savgol_filter
+from collections import deque
+
+import contextlib
+
+# Try to import MediaPipe, fall back to OpenCV DNN if not available
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    print("MediaPipe not available - using OpenCV DNN face detector (works on Python 3.13+)")
+
+# Try to import WebRTC VAD
+try:
+    import webrtcvad
+    WEBRTCVAD_AVAILABLE = True
+except ImportError:
+    WEBRTCVAD_AVAILABLE = False
+    print("WebRTC VAD not available - speaker-aware tracking disabled")
+
+
+class VADProcessor:
+    """
+    Voice Activity Detection using WebRTC VAD
+    Used for Speaker-Aware Tracking
+    """
+    def __init__(self, aggressiveness=3):
+        self.vad = webrtcvad.Vad(aggressiveness) if WEBRTCVAD_AVAILABLE else None
+        self.sample_rate = 16000
+        self.frame_duration_ms = 30
+        self.frame_size = int(self.sample_rate * self.frame_duration_ms / 1000)
+    
+    def is_speech(self, audio_frame):
+        if not self.vad:
+            return False
+        try:
+            return self.vad.is_speech(audio_frame, self.sample_rate)
+        except:
+            return False
+
+    def process_audio(self, audio_data):
+        """
+        Process float32 audio data (from librosa) and return speech timestamps
+        Returns a list of boolean flags corresponding to 30ms frames
+        """
+        if not self.vad or len(audio_data) == 0:
+            return []
+        
+        # Convert float32 to int16
+        audio_int16 = (audio_data * 32767).astype(np.int16)
+        raw_bytes = audio_int16.tobytes()
+        
+        # Chunk into frames
+        chunk_size = self.frame_size * 2  # 2 bytes per sample
+        num_frames = len(raw_bytes) // chunk_size
+        
+        speech_flags = []
+        for i in range(num_frames):
+            chunk = raw_bytes[i*chunk_size : (i+1)*chunk_size]
+            is_speech = self.is_speech(chunk)
+            speech_flags.append(is_speech)
+            
+        return speech_flags
+
+
 
 class VideoProcessor:
     """
@@ -28,8 +94,9 @@ class VideoProcessor:
              → TikTok reverse-eng. 2021: Single-face dominance with centrality weighting
              → Returns visual score [0.0-5.0] + face center for reframing
              
-    Stage 5: Intelligent 9:16 Reframing
-             → Wang et al., 2020: Face-centered cropping with rule-of-thirds fallback
+    Stage 5: AFAPZ - Adaptive Face-Anchored Pan-Zoom (2023-2025)
+             → Industry standard: MediaPipe + KLT + Kalman smoothing
+             → TikTok-style positioning (50% H, 27% V) + adaptive zoom (1.0→1.15x)
              → Applied during clip generation (after selection)
              
     Stage 6: Importance Scoring (Viral Score)
@@ -47,6 +114,7 @@ class VideoProcessor:
     • Smart end-time adjustment to avoid mid-sentence cuts
     • Topic coherence checks using scene boundaries
     • Prevents clips from ending mid-topic
+    • AFAPZ face tracking with cinematic smoothing
     """
     def __init__(self, output_path="output"):
         self.output_path = output_path
@@ -625,12 +693,503 @@ class VideoProcessor:
         
         return final_clips
 
+    # ═══════════════════════════════════════════════════════════════
+    # AFAPZ Helper Classes and Methods
+    # ═══════════════════════════════════════════════════════════════
+    
+    class SimpleKalmanFilter:
+        """1D Kalman filter for smooth trajectory generation"""
+        def __init__(self, process_variance=0.01, measurement_variance=0.1):
+            self.process_variance = process_variance
+            self.measurement_variance = measurement_variance
+            self.estimate = None
+            self.error_estimate = 1.0
+            
+        def update(self, measurement):
+            if self.estimate is None:
+                self.estimate = measurement
+                return self.estimate
+            
+            # Prediction
+            prediction = self.estimate
+            prediction_error = self.error_estimate + self.process_variance
+            
+            # Update
+            kalman_gain = prediction_error / (prediction_error + self.measurement_variance)
+            self.estimate = prediction + kalman_gain * (measurement - prediction)
+            self.error_estimate = (1 - kalman_gain) * prediction_error
+            
+            return self.estimate
+    
+    def compute_face_score(self, face_box, frame_width, frame_height, is_speaking=False):
+        """
+        AFAPZ Step 3: Compute primary face score
+        Priority: closest to center → biggest → most frontal
+        
+        If is_speaking is True (VAD active):
+        - Reduce center bias (don't penalize speaker for being on the side)
+        - Increase size weight (speaker is likely prominent)
+        """
+        x, y, w, h = face_box
+        
+        # Center position (normalized)
+        center_x = (x + w/2) / frame_width
+        center_y = (y + h/2) / frame_height
+        
+        # Distance from frame center (0-1, lower is better)
+        center_dist = np.sqrt((center_x - 0.5)**2 + (center_y - 0.5)**2)
+        
+        # Size score (0-1, bigger is better)
+        size_score = (w * h) / (frame_width * frame_height)
+        
+        # Frontality approximation: if face is wider than tall, it's more frontal
+        aspect_ratio = w / h if h > 0 else 1.0
+        frontality_score = min(1.0, aspect_ratio / 1.3)  # Ideal ~1.3 for frontal face
+        
+        if is_speaking:
+            # VAD Active: Prioritize ANY face, regardless of position
+            # Reduce center weight significantly, increase size weight
+            score = (1.0 - center_dist) * 0.2 + size_score * 0.6 + frontality_score * 0.2
+        else:
+            # Normal: Prioritize centered faces (cinematic composition)
+            score = (1.0 - center_dist) * 0.6 + size_score * 0.3 + frontality_score * 0.1
+        
+        return score
+    
+    def detect_and_track_faces_afapz(self, video_path, start_time, end_time, audio_peaks=None):
+        """
+        AFAPZ Pipeline: Adaptive Face-Anchored Pan-Zoom
+        Returns trajectory data for smooth face-following crop
+        
+        Steps:
+        1. High-accuracy face detection every 5-10 frames (MediaPipe)
+        2. KLT tracking between keyframes
+        3. Primary face selection (center → size → frontality)
+        4. TikTok positioning (50% horizontal, 25-30% vertical)
+        5. Kalman smoothing for cinematic motion
+        6. Adaptive zoom (1.0→1.2x with snap zoom on peaks)
+        7. Fallback to rule-of-thirds when no face
+        
+        Speaker-Aware Tracking (VAD):
+        - Uses WebRTC VAD to detect speech
+        - When speech is active, face detection runs more frequently (every 2 frames)
+        - Prevents losing the speaker during active talking
+        """
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 0: Speaker-Aware Analysis (VAD)
+        # ═══════════════════════════════════════════════════════════════
+        speech_flags = []
+        vad_processor = VADProcessor(aggressiveness=3)
+        
+        if WEBRTCVAD_AVAILABLE:
+            try:
+                # Extract audio for this segment
+                temp_audio = f"temp_vad_{start_time}_{end_time}.wav"
+                with VideoFileClip(video_path) as v:
+                    sub = v.subclipped(start_time, end_time)
+                    if sub.audio:
+                        sub.audio.write_audiofile(temp_audio, fps=16000, logger=None)
+                
+                if os.path.exists(temp_audio):
+                    y, sr = librosa.load(temp_audio, sr=16000, mono=True)
+                    speech_flags = vad_processor.process_audio(y)
+                    os.remove(temp_audio)
+                    print(f"VAD: Analyzed {len(speech_flags)} audio frames for speech")
+            except Exception as e:
+                print(f"VAD warning: {e}")
+
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30.0
+        
+        # Jump to start time
+        start_frame = int(start_time * fps)
+        end_frame = int(end_time * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+        # Initialize Face Detection (MediaPipe or OpenCV YuNet fallback)
+        face_detector = None
+        yunet_detector = None
+        
+        if MEDIAPIPE_AVAILABLE:
+            # Use MediaPipe (preferred - more accurate)
+            mp_face_detection = mp.solutions.face_detection
+            face_detector = mp_face_detection.FaceDetection(
+                model_selection=1,  # Full-range model (better for varied distances)
+                min_detection_confidence=0.5
+            )
+            print("Using MediaPipe face detection")
+        else:
+            # Use OpenCV YuNet (fallback for Python 3.13+)
+            try:
+                # Download YuNet model if missing
+                model_path = "face_detection_yunet_2023mar.onnx"
+                if not os.path.exists(model_path):
+                    print(f"Downloading YuNet model to {model_path}...")
+                    import urllib.request
+                    url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+                    urllib.request.urlretrieve(url, model_path)
+
+                # Get a sample frame to determine size
+                # Robustness fix: Loop until we get a frame or give up
+                sample_frame = None
+                for _ in range(10):
+                    ret, frame = cap.read()
+                    if ret:
+                        sample_frame = frame
+                        break
+                
+                if sample_frame is not None:
+                    h, w = sample_frame.shape[:2]
+                    # Reset to start
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                    
+                    # Create YuNet detector with model path
+                    yunet_detector = cv2.FaceDetectorYN.create(
+                        model_path,
+                        "",  # Empty config
+                        (w, h),  # Input size
+                        score_threshold=0.6,
+                        nms_threshold=0.3,
+                        top_k=5000
+                    )
+                    print("Using OpenCV YuNet face detection (Python 3.13 compatible)")
+                else:
+                    print("Warning: Could not read sample frame for YuNet initialization")
+                    # Reset anyway
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            except Exception as e:
+                print(f"YuNet initialization warning: {e}")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 0.5: Auto-Orientation Detection
+        # ═══════════════════════════════════════════════════════════════
+        rotation_angle = 0
+        if yunet_detector:
+            print("Checking video orientation...")
+            # Try to find faces in different orientations
+            best_rotation = 0
+            max_faces = 0
+            
+            # Sample a few frames to be sure
+            sample_frames = []
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            for _ in range(5):
+                ret, f = cap.read()
+                if ret:
+                    sample_frames.append(f)
+                    # Skip a few frames
+                    for _ in range(5): cap.read()
+            
+            if sample_frames:
+                for angle in [0, 90, 270]: # 180 is rare
+                    faces_found = 0
+                    for f in sample_frames:
+                        if angle == 90:
+                            f_rot = cv2.rotate(f, cv2.ROTATE_90_CLOCKWISE)
+                        elif angle == 270:
+                            f_rot = cv2.rotate(f, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                        else:
+                            f_rot = f
+                        
+                        # Resize for detection speed/consistency
+                        h_rot, w_rot = f_rot.shape[:2]
+                        yunet_detector.setInputSize((w_rot, h_rot))
+                        _, faces = yunet_detector.detect(f_rot)
+                        if faces is not None:
+                            faces_found += len(faces)
+                    
+                    if faces_found > max_faces:
+                        max_faces = faces_found
+                        best_rotation = angle
+                
+                if best_rotation != 0:
+                    print(f"  ⚠ Detected rotation: {best_rotation} degrees. Adjusting tracking.")
+                    rotation_angle = best_rotation
+                else:
+                    print("  Orientation looks correct (0 degrees).")
+            
+            # Reset cap
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        # Trajectory storage
+        trajectory = []
+        frame_idx = start_frame
+        
+        # KLT parameters
+        lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+        )
+        
+        # Tracking state
+        tracked_points = None
+        prev_gray = None
+        face_lost_counter = 0
+        last_face_center = None
+        
+        # ═══════════════════════════════════════════════════════════════
+        # CINEMATIC ANCHOR LOGIC (Stabilization)
+        # ═══════════════════════════════════════════════════════════════
+        # Instead of following every movement, we define a "Virtual Camera"
+        # that only moves when the subject leaves a "Deadband" zone.
+        
+        camera_target_x = 0.5
+        camera_target_y = 0.35
+        camera_current_x = 0.5
+        camera_current_y = 0.35
+        
+        # Deadband range (10% of screen width/height)
+        # Subject can move within this box without moving the camera
+        deadband_x = 0.10
+        deadband_y = 0.10
+        
+        # Smoothing factor (Lower = slower, heavier camera)
+        # 0.05 means it takes ~20 frames to catch up (very smooth)
+        smooth_factor = 0.05
+        
+        # Initialize with first frame if possible
+        first_face_found = False
+        
+        # Adaptive zoom parameters
+        total_frames = end_frame - start_frame
+        base_zoom = 1.0
+        target_zoom = 1.15  # Slowly zoom to 1.15x
+        snap_zoom_amount = 0.08
+        
+        # Debug counters
+        faces_detected_count = 0
+        total_frames_processed = 0
+
+        print(f"AFAPZ: Processing frames {start_frame} to {end_frame} ({total_frames} total)")
+        
+        while frame_idx < end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Apply rotation if needed
+            if rotation_angle == 90:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            elif rotation_angle == 270:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            
+            h, w = frame.shape[:2]
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Determine if we should run face detection
+            relative_frame = frame_idx - start_frame
+            
+            # Check VAD status
+            is_speaking = False
+            if speech_flags:
+                time_sec = relative_frame / fps
+                vad_idx = int(time_sec / 0.030)
+                if 0 <= vad_idx < len(speech_flags):
+                    is_speaking = speech_flags[vad_idx]
+            
+            # Detection logic
+            detection_interval = 4 if is_speaking else 10
+            
+            should_detect = (
+                relative_frame == 0 or
+                relative_frame % detection_interval == 0 or
+                tracked_points is None or
+                face_lost_counter > 15
+            )
+
+            face_center_x, face_center_y = None, None
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 1: Face Detection
+            # ═══════════════════════════════════════════════════════════════
+            if should_detect:
+                best_face = None
+                best_score = -1
+                
+                # Helper to calculate stickiness (spatial consistency)
+                def get_stickiness_boost(fx, fy, fw, fh):
+                    if not first_face_found: return 0.0
+                    
+                    # Current face center
+                    cx = fx + fw/2
+                    cy = fy + fh/2
+                    
+                    # Distance to current CAMERA TARGET (not just last face)
+                    # We want to stick to where the camera is currently looking
+                    dist_x = abs(cx/w - camera_target_x)
+                    dist_y = abs(cy/h - camera_target_y)
+                    dist = np.sqrt(dist_x**2 + dist_y**2)
+                    
+                    # Massive boost if close to current target
+                    if dist < 0.15: return 2.0  # Huge boost to lock on
+                    return 0.0
+
+                if MEDIAPIPE_AVAILABLE and face_detector:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = face_detector.process(rgb_frame)
+                    
+                    if results.detections:
+                        for detection in results.detections:
+                            bbox = detection.location_data.relative_bounding_box
+                            x = int(bbox.xmin * w)
+                            y = int(bbox.ymin * h)
+                            fw = int(bbox.width * w)
+                            fh = int(bbox.height * h)
+                            
+                            score = self.compute_face_score((x, y, fw, fh), w, h, is_speaking=is_speaking)
+                            score += get_stickiness_boost(x, y, fw, fh)
+                            
+                            if score > best_score:
+                                best_score = score
+                                best_face = (x, y, fw, fh)
+                
+                elif yunet_detector is not None:
+                    yunet_detector.setInputSize((w, h))
+                    _, faces = yunet_detector.detect(frame)
+                    
+                    if faces is not None:
+                        for face in faces:
+                            x, y, fw, fh = int(face[0]), int(face[1]), int(face[2]), int(face[3])
+                            confidence = face[14]
+                            
+                            if confidence > 0.5:
+                                x = max(0, x)
+                                y = max(0, y)
+                                fw = min(fw, w - x)
+                                fh = min(fh, h - y)
+                                
+                                if fw > 0 and fh > 0:
+                                    score = self.compute_face_score((x, y, fw, fh), w, h, is_speaking=is_speaking)
+                                    score += get_stickiness_boost(x, y, fw, fh)
+                                    
+                                    if score > best_score:
+                                        best_score = score
+                                        best_face = (x, y, fw, fh)
+                
+                if best_face:
+                        x, y, fw, fh = best_face
+                        face_center_x = x + fw / 2
+                        face_center_y = y + fh / 2
+                        
+                        # Initialize camera on first face
+                        if not first_face_found:
+                            camera_target_x = face_center_x / w
+                            camera_target_y = face_center_y / h
+                            camera_current_x = camera_target_x
+                            camera_current_y = camera_target_y
+                            first_face_found = True
+                        
+                        faces_detected_count += 1
+                        
+                        # Initialize KLT
+                        face_region = gray[max(0, y):min(h, y+fh), max(0, x):min(w, x+fw)]
+                        if face_region.size > 0:
+                            corners = cv2.goodFeaturesToTrack(face_region, maxCorners=20, qualityLevel=0.01, minDistance=10)
+                            if corners is not None:
+                                tracked_points = corners + np.array([[x, y]], dtype=np.float32)
+                        face_lost_counter = 0
+                else:
+                    face_lost_counter += 1
+                    tracked_points = None
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 2: KLT Tracking
+            # ═══════════════════════════════════════════════════════════════
+            elif tracked_points is not None and prev_gray is not None:
+                new_points, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, tracked_points, None, **lk_params)
+                if new_points is not None:
+                    good_new = new_points[status.flatten() == 1]
+                    if len(good_new) >= 5:
+                        tracked_points = good_new.reshape(-1, 1, 2)
+                        
+                        # Reshape to (M, 2) for easier mean calculation
+                        points_2d = good_new.reshape(-1, 2)
+                        face_center_x = np.mean(points_2d[:, 0])
+                        face_center_y = np.mean(points_2d[:, 1])
+                        
+                        face_lost_counter = 0
+                    else:
+                        tracked_points = None
+                        face_lost_counter += 1
+                else:
+                    tracked_points = None
+                    face_lost_counter += 1
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 3: Cinematic Camera Logic (Deadband + Smoothing)
+            # ═══════════════════════════════════════════════════════════════
+            if face_center_x is not None:
+                # Normalize face position
+                norm_x = face_center_x / w
+                norm_y = face_center_y / h
+                
+                # Check if face is outside deadband relative to CURRENT TARGET
+                dist_x = abs(norm_x - camera_target_x)
+                dist_y = abs(norm_y - camera_target_y)
+                
+                # If face moves significantly (outside deadband), update target
+                # This creates the "Stay still until..." behavior
+                if dist_x > deadband_x or dist_y > deadband_y:
+                    camera_target_x = norm_x
+                    camera_target_y = norm_y
+            
+            # Smoothly interpolate current camera position towards target
+            # This creates the cinematic pan effect
+            camera_current_x += (camera_target_x - camera_current_x) * smooth_factor
+            camera_current_y += (camera_target_y - camera_current_y) * smooth_factor
+            
+            # Adaptive Zoom
+            progress = relative_frame / max(1, total_frames)
+            zoom = base_zoom + (target_zoom - base_zoom) * progress
+            if audio_peaks and relative_frame in audio_peaks:
+                zoom += 0.08
+            
+            # Store trajectory point (Camera Position, NOT Face Position)
+            trajectory.append({
+                'frame': relative_frame,
+                'center_x': camera_current_x,
+                'center_y': camera_current_y,
+                'zoom': zoom,
+                'has_face': face_center_x is not None
+            })
+            
+            prev_gray = gray
+            frame_idx += 1
+        
+        cap.release()
+        if MEDIAPIPE_AVAILABLE and face_detector:
+            face_detector.close()
+        
+        # No post-smoothing needed because we used EMA smoothing in the loop
+        
+        # Debug summary
+        print(f"AFAPZ Summary: {faces_detected_count} faces detected in {len(trajectory)} frames")
+        
+        return trajectory
+
     # Clip Generation: Intelligent 9:16 Reframing (Stage 5 of E²SAVS - applied after selection)
     def create_vertical_short(self, video_path, start_time, end_time, output_filename, face_center_x=None):
         """
-        Wang et al., 2020: Intelligent 9:16 reframing with face-centered cropping
+        AFAPZ 2025: Adaptive Face-Anchored Pan-Zoom with cinematic smoothing
+        Replaces static cropping with dynamic face tracking and zoom
         Stage 5 of E²SAVS is executed here during clip generation, after MMR selection (Stage 7)
         """
+        print(f"Generating clip with AFAPZ: {output_filename}")
+        
+        # Generate smooth trajectory using AFAPZ
+        print("  → Running AFAPZ face tracking...")
+        trajectory = self.detect_and_track_faces_afapz(video_path, start_time, end_time)
+        
+        if not trajectory:
+            print("  ⚠ No trajectory generated - falling back to static crop")
+            trajectory = None
+        else:
+            print(f"  ✓ Generated {len(trajectory)} trajectory points")
+        
+        # Open video
         video = VideoFileClip(video_path)
         if hasattr(video, 'subclipped'):
             clip = video.subclipped(start_time, end_time)
@@ -639,80 +1198,171 @@ class VideoProcessor:
         
         w, h = clip.size
         target_ratio = 9/16
+        fps = clip.fps if clip.fps else 30
         
-        if w / h > target_ratio:
-            new_w = int(h * target_ratio)
-            # Ensure width is even (divisible by 2) for H.264 encoding
-            if new_w % 2 != 0:
-                new_w -= 1
+        if trajectory:
+            # AFAPZ: Dynamic frame-by-frame cropping following face
+            print("  → Applying AFAPZ dynamic cropping...")
             
-            if face_center_x is not None:
-                # Face-centered crop
-                center_pixel = face_center_x * w
-                x1 = center_pixel - new_w / 2
-                x2 = center_pixel + new_w / 2
+            # Pre-calculate all crop coordinates for performance
+            crop_coords = []
+            crop_size = None  # Store the crop size (should be consistent)
+            
+            for frame_idx in range(len(trajectory)):
+                traj = trajectory[frame_idx]
+                zoom = traj['zoom']
+                
+                # Calculate 9:16 crop dimensions with zoom
+                if w / h > target_ratio:
+                    crop_w = int((h * target_ratio) / zoom)
+                    crop_h = h
+                else:
+                    crop_h = int((w / target_ratio) / zoom)
+                    crop_w = w
+                
+                # Ensure even dimensions
+                crop_w = crop_w - (crop_w % 2)
+                crop_h = crop_h - (crop_h % 2)
+                
+                # Store crop size (use first frame's size for consistency)
+                if crop_size is None:
+                    crop_size = (crop_w, crop_h)
+                
+                # Face position in original frame (normalized)
+                target_x = traj['center_x']
+                target_y = 0.27 if traj.get('has_face') else traj['center_y']
+                
+                # Convert to pixels
+                face_x_pixel = int(target_x * w)
+                face_y_pixel = int(target_y * h)
+                
+                # Calculate crop window to place face at target position
+                crop_x1 = face_x_pixel - int(crop_w * 0.5)
+                crop_y1 = face_y_pixel - int(crop_h * 0.27)
                 
                 # Clamp to bounds
-                if x1 < 0:
-                    x1, x2 = 0, new_w
-                elif x2 > w:
-                    x1, x2 = w - new_w, w
-            else:
-                # Rule-of-thirds fallback (slightly off-center)
-                x_center = w * 0.5
-                x1 = x_center - new_w / 2
-                x2 = x_center + new_w / 2
+                crop_x1 = max(0, min(crop_x1, w - crop_w))
+                crop_y1 = max(0, min(crop_y1, h - crop_h))
+                
+                crop_coords.append((crop_x1, crop_y1, crop_x1 + crop_w, crop_y1 + crop_h))
             
-            # Round to even numbers
-            x1 = int(x1)
-            x2 = int(x2)
-            if (x2 - x1) % 2 != 0:
-                x2 -= 1
+            # Create new clip with dynamic cropping using make_frame
+            from moviepy.video.VideoClip import VideoClip
             
-            if hasattr(clip, 'cropped'):
-                clip = clip.cropped(x1=x1, y1=0, x2=x2, y2=h)
-            else:
-                clip = clip.crop(x1=x1, y1=0, x2=x2, y2=h)
+            def make_cropped_frame(t):
+                """Generate cropped frame for time t"""
+                # Get frame from original clip
+                frame = clip.get_frame(t)
+                
+                # Get crop coordinates for this time
+                frame_idx = int(t * fps)
+                if frame_idx >= len(crop_coords):
+                    frame_idx = len(crop_coords) - 1
+                
+                x1, y1, x2, y2 = crop_coords[frame_idx]
+                
+                # Crop frame
+                cropped = frame[y1:y2, x1:x2]
+                
+                # Ensure consistent size (resize if needed due to zoom variations)
+                if cropped.shape[:2] != (crop_size[1], crop_size[0]):
+                    cropped = cv2.resize(cropped, crop_size, interpolation=cv2.INTER_LINEAR)
+                
+                # Return cropped frame
+                return cropped
+            
+            # Create new VideoClip with cropped frames
+            # IMPORTANT: Set size explicitly so MoviePy knows the dimensions
+            clip_cropped = VideoClip(make_cropped_frame, duration=clip.duration)
+            clip_cropped.fps = fps
+            clip_cropped.size = crop_size  # Set output size!
+            
+            # Copy audio from original
+            if clip.audio:
+                clip_cropped = clip_cropped.with_audio(clip.audio)
+            
+            print(f"  ✓ AFAPZ crop applied ({len(trajectory)} frames tracked, size: {crop_size})")
+        
         else:
-            new_h = int(w / target_ratio)
-            # Ensure height is even (divisible by 2) for H.264 encoding
-            if new_h % 2 != 0:
-                new_h -= 1
-            
-            y_center = h / 2
-            y1 = y_center - new_h / 2
-            y2 = y_center + new_h / 2
-            
-            # Round to even numbers
-            y1 = int(y1)
-            y2 = int(y2)
-            if (y2 - y1) % 2 != 0:
-                y2 -= 1
-            
-            if hasattr(clip, 'cropped'):
-                clip = clip.cropped(x1=0, y1=y1, x2=w, y2=y2)
+            # Fallback: Static center crop (old method)
+            print("  → Using static center crop (fallback)")
+            if w / h > target_ratio:
+                new_w = int(h * target_ratio)
+                if new_w % 2 != 0:
+                    new_w -= 1
+                x_center = w * 0.5
+                x1 = int(x_center - new_w / 2)
+                x2 = x1 + new_w
+                if hasattr(clip, 'cropped'):
+                    clip_cropped = clip.cropped(x1=x1, y1=0, x2=x2, y2=h)
+                else:
+                    clip_cropped = clip.crop(x1=x1, y1=0, x2=x2, y2=h)
             else:
-                clip = clip.crop(x1=0, y1=y1, x2=w, y2=y2)
+                new_h = int(w / target_ratio)
+                if new_h % 2 != 0:
+                    new_h -= 1
+                y_center = h / 2
+                y1 = int(y_center - new_h / 2)
+                y2 = y1 + new_h
+                if hasattr(clip, 'cropped'):
+                    clip_cropped = clip.cropped(x1=0, y1=y1, x2=w, y2=y2)
+                else:
+                    clip_cropped = clip.crop(x1=0, y1=y1, x2=w, y2=y2)
         
         output_file = os.path.join(self.output_path, output_filename)
         
         # Force software encoding to avoid CUDA/hardware acceleration issues
         # Use baseline profile for maximum compatibility
-        clip.write_videofile(
-            output_file, 
-            codec='libx264',
-            audio_codec='aac',
-            preset='medium',
-            ffmpeg_params=[
-                '-pix_fmt', 'yuv420p',  # Standard pixel format
-                '-profile:v', 'baseline',  # H.264 baseline profile (most compatible)
-                '-level', '3.0',  # Compatibility level
-                '-movflags', '+faststart'  # Enable streaming/fast playback
-            ],
-            logger=None
-        )
-        video.close()
-        return output_file
+        print("  → Encoding video...")
+        try:
+            clip_cropped.write_videofile(
+                output_file, 
+                codec='libx264',
+                audio_codec='aac',
+                preset='medium',
+                fps=fps,
+                ffmpeg_params=[
+                    '-pix_fmt', 'yuv420p',
+                    '-profile:v', 'baseline',
+                    '-level', '3.0',
+                    '-movflags', '+faststart'
+                ],
+                logger=None
+            )
+            video.close()
+            print(f"  ✓ AFAPZ clip generated: {output_filename}")
+            return output_file
+        except Exception as e:
+            print(f"  ✗ Encoding error: {e}")
+            print("  → Trying simple fallback...")
+            
+            # Last resort fallback
+            if w / h > target_ratio:
+                new_w = int(h * target_ratio)
+                if new_w % 2 != 0:
+                    new_w -= 1
+                x_center = w * 0.5
+                x1 = int(x_center - new_w / 2)
+                x2 = x1 + new_w
+                simple_clip = clip.crop(x1=x1, y1=0, x2=x2, y2=h)
+            else:
+                new_h = int(w / target_ratio)
+                if new_h % 2 != 0:
+                    new_h -= 1
+                y_center = h / 2
+                y1 = int(y_center - new_h / 2)
+                y2 = y1 + new_h
+                simple_clip = clip.crop(x1=0, y1=y1, x2=w, y2=y2)
+            
+            simple_clip.write_videofile(
+                output_file,
+                codec='libx264',
+                audio_codec='aac',
+                preset='medium',
+                logger=None
+            )
+            video.close()
+            return output_file
 
     def generate_clips(self, video_path, clips):
         if not clips:

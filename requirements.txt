@@ -11,3 +11,7 @@ requests
 Pillow
 numpy
 librosa
+scipy
+# mediapipe  # Optional: For Python <=3.12 (better accuracy)
+webrtcvad    # For Speaker-Aware Tracking
+. Python 3.13+ uses OpenCV DNN fallback.
