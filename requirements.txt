@@ -1,0 +1,13 @@
+PyQt6
+yt-dlp
+moviepy
+ffmpeg-python
+opencv-python
+scenedetect
+playwright
+google-api-python-client
+keyring
+requests
+Pillow
+numpy
+librosa
