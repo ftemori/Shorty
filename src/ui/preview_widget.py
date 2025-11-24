@@ -29,40 +29,59 @@ class VideoPreviewWidget(QWidget):
         layout.setSpacing(20)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        title = QLabel("Video Ready")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #ffffff;")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        # Container for video display area
+        self.video_container = QWidget()
+        video_container_layout = QVBoxLayout(self.video_container)
+        video_container_layout.setContentsMargins(0, 0, 0, 0)
+        video_container_layout.setSpacing(0)
         
-        # Integrated Player
-        self.player = VideoPlayer()
-        self.player.setFixedSize(800, 450) # 16:9 aspect ratio
-        layout.addWidget(self.player)
-
-        # Video Info Card
-        self.info_label = QLabel()
+        # Video Info Frame - shown by default when no video
+        self.video_info_frame = QFrame()
+        self.video_info_frame.setFixedSize(900, 505)
+        self.video_info_frame.setStyleSheet("""
+            QFrame {
+                background-color: #2a2a2a;
+                border-radius: 12px;
+                border: 1px solid #3a3a3a;
+            }
+        """)
+        
+        info_frame_layout = QVBoxLayout(self.video_info_frame)
+        info_frame_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.info_label = QLabel("No video loaded")
         self.info_label.setStyleSheet("""
             QLabel {
-                background-color: #333;
-                padding: 15px;
-                border-radius: 10px;
                 color: #ddd;
-                font-size: 14px;
+                font-size: 16px;
+                background: transparent;
             }
         """)
         self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.info_label)
+        self.info_label.setWordWrap(True)
+        info_frame_layout.addWidget(self.info_label)
+        
+        video_container_layout.addWidget(self.video_info_frame, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        # Video Player - hidden by default, shown when video loads
+        self.player = VideoPlayer()
+        self.player.setFixedSize(900, 505)
+        self.player.hide()
+        video_container_layout.addWidget(self.player, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        layout.addWidget(self.video_container, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Analyze Button
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(20)
+        btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.analyze_btn = QPushButton("🔎 Analize Shorts")
         self.analyze_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.analyze_btn.setStyleSheet("""
             QPushButton {
                 padding: 15px 30px;
-                background-color: #4a90e2;
+                background-color: #27ae60;
                 color: white;
                 border: none;
                 border-radius: 5px;
@@ -70,7 +89,7 @@ class VideoPreviewWidget(QWidget):
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #357abd;
+                background-color: #2ecc71;
             }
             QPushButton:disabled {
                 background-color: #2c3e50;
@@ -81,6 +100,15 @@ class VideoPreviewWidget(QWidget):
         btn_layout.addWidget(self.analyze_btn)
 
         layout.addLayout(btn_layout)
+        
+        # Separator Line
+        self.separator = QFrame()
+        self.separator.setFrameShape(QFrame.Shape.HLine)
+        self.separator.setFrameShadow(QFrame.Shadow.Sunken)
+        self.separator.setStyleSheet("background-color: #444; margin-top: 50px;")
+        self.separator.setFixedHeight(2)
+        self.separator.setVisible(False)
+        layout.addWidget(self.separator)
 
         # Analysis Results Card
         self.analysis_card = QFrame()
@@ -149,14 +177,6 @@ class VideoPreviewWidget(QWidget):
 
         layout.addWidget(self.analysis_card)
         self.analysis_card.setVisible(False)
-        
-        # Back Button
-        self.back_btn = QPushButton("Back")
-        self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.back_btn.setFlat(True)
-        self.back_btn.setStyleSheet("color: #888; text-decoration: underline;")
-        self.back_btn.clicked.connect(self.on_back)
-        layout.addWidget(self.back_btn)
 
     def set_video(self, path):
         self.video_path = path
@@ -164,13 +184,17 @@ class VideoPreviewWidget(QWidget):
         size_mb = os.path.getsize(path) / (1024 * 1024)
         self.info_label.setText(f"File: {filename}\nSize: {size_mb:.1f} MB")
         
+        # Hide info frame and show video player
+        self.video_info_frame.hide()
+        self.player.show()
         self.player.set_source(path)
+        
         self.reset_analysis()
 
     def reset_analysis(self):
         self.analyzed_clips = []
-        self.player.setVisible(True)
-        self.info_label.setVisible(True)
+        # Don't show/hide player or info frame here - that's handled by set_video
+        self.separator.setVisible(False)
         self.analysis_progress_label.setVisible(False)
         self.analysis_progress_bar.setVisible(False)
         self.analysis_progress_bar.setValue(0)
@@ -183,7 +207,9 @@ class VideoPreviewWidget(QWidget):
         self.set_analyze_busy(False)
 
     def begin_analysis(self):
+        # Hide player during analysis
         self.player.setVisible(False)
+        self.separator.setVisible(True)
         self.analysis_card.setVisible(True)
         self.analysis_status.setText("Analyzing video... This may take a moment.")
         self.analysis_progress_label.setText("Preparing...")
@@ -207,9 +233,9 @@ class VideoPreviewWidget(QWidget):
             self.analysis_progress_label.setText("Analyzing video...")
 
     def show_analysis(self, clips):
+        # Keep player hidden during analysis results
         self.player.stop()
         self.player.setVisible(False)
-        self.info_label.setVisible(False)
         self.analysis_progress_label.setVisible(False)
         self.analysis_progress_bar.setVisible(False)
 
@@ -263,14 +289,18 @@ class VideoPreviewWidget(QWidget):
         self.update_generate_state()
 
     def on_analyze(self):
-        self.player.stop()
+        # Stop player before analysis
+        if hasattr(self, 'player'):
+            self.player.stop()
         if self.video_path:
             self.begin_analysis()
             self.set_analyze_busy(True)
             self.analyze_clicked.emit(self.video_path)
 
     def on_generate_selected(self):
-        self.player.stop()
+        # Stop player before generation
+        if hasattr(self, 'player'):
+            self.player.stop()
         if not self.video_path:
             return
         selected = self.get_selected_clips()
@@ -278,7 +308,6 @@ class VideoPreviewWidget(QWidget):
             self.generate_requested.emit(self.video_path, selected)
 
     def on_back(self):
-        self.player.stop()
         self.back_clicked.emit()
 
     def set_analyze_busy(self, busy):

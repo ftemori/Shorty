@@ -1,9 +1,8 @@
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QScrollArea, QGridLayout, QLabel, QPushButton, QFrame, QDialog
+    QWidget, QVBoxLayout, QScrollArea, QGridLayout, QLabel, QPushButton, QFrame, QDialog, QMessageBox
 )
 from PyQt6.QtCore import Qt
 import os
-from src.ui.player_widget import VideoPlayer
 
 class ResultsWidget(QWidget):
     def __init__(self):
@@ -180,20 +179,8 @@ class ResultsWidget(QWidget):
                 QMessageBox.critical(self, "Error", f"Failed to save video:\n{str(e)}")
 
     def play_video(self, path):
-        dialog = QDialog(self)
-        dialog.setWindowTitle(os.path.basename(path))
-        dialog.resize(400, 750) # Vertical aspect ratio
-        
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(0, 0, 0, 0)
-        
-        player = VideoPlayer(dialog)
-        layout.addWidget(player)
-        
-        player.set_source(path)
-        
-        dialog.exec()
-        
-        # Cleanup
-        player.stop()
-        player.deleteLater()
+        QMessageBox.information(
+            self, 
+            "Playback Removed", 
+            f"Video playback has been removed.\n\nVideo file location:\n{path}"
+        )
