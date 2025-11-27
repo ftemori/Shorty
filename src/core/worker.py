@@ -2,6 +2,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from src.core.downloader import VideoDownloader
 from src.core.processor import VideoProcessor
 import os
+import re
 
 class Worker(QThread):
     progress = pyqtSignal(str)
@@ -29,7 +30,9 @@ class Worker(QThread):
                 self.progress.emit(f"Downloading video: {url}")
                 def hook(d):
                     if d['status'] == 'downloading':
-                        p = d.get('_percent_str', '0%').replace('%','')
+                        p = d.get('_percent_str', '0%')
+                        # Remove ANSI escape codes
+                        p = re.sub(r'\x1b\[[0-9;]*m', '', p).replace('%','')
                         self.progress.emit(f"Downloading: {p}%")
                 video_path = self.downloader.download_video(url, progress_hook=hook)
                 self.finished.emit(video_path)
@@ -56,7 +59,9 @@ class Worker(QThread):
                 for idx, clip in enumerate(clips, start=1):
                     score = clip.get("score")
                     label = f"Score: {score}" if score is not None else ""
-                    self.progress.emit(f"Generating clip {idx}/{total} {label}")
+                    # Emit progress as percentage
+                    percent = int((idx - 1) / total * 100) if total > 0 else 0
+                    self.progress.emit(f"GENERATION_PROGRESS:{percent}")
                     start = clip.get("start")
                     end = clip.get("end")
                     if start is None or end is None:
@@ -65,6 +70,9 @@ class Worker(QThread):
                     output_filename = clip.get("output_filename") or f"{clip_id}_{base_name}"
                     clip_path = self.processor.create_vertical_short(video_path, start, end, output_filename)
                     generated_clips.append(clip_path)
+                    # Emit 100% when done with this clip
+                    percent = int(idx / total * 100) if total > 0 else 100
+                    self.progress.emit(f"GENERATION_PROGRESS:{percent}")
                 self.finished.emit(generated_clips)
 
             elif self.task_type == "process_file":

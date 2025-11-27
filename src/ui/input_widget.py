@@ -21,14 +21,13 @@ class InputWidget(QWidget):
         self.drop_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.drop_area.setStyleSheet("""
             QLabel {
-                border: 2px solid #444;
+                border: none;
                 border-radius: 10px;
                 color: #aaa;
                 font-size: 16px;
                 background-color: #252525;
             }
             QLabel:hover {
-                border-color: #4a90e2;
                 color: #fff;
                 background-color: #2a2a2a;
             }

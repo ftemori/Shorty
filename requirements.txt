@@ -14,4 +14,8 @@ librosa
 scipy
 # mediapipe  # Optional: For Python <=3.12 (better accuracy)
 webrtcvad    # For Speaker-Aware Tracking
-. Python 3.13+ uses OpenCV DNN fallback.
+
+# STACE: Semantic Turn-Aligned Clip Extraction (2025)
+openai-whisper  # Local transcription with timestamps
+spacy           # Sentence segmentation and NLP
+scikit-learn    # TF-IDF coherence scoring

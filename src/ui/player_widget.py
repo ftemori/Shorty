@@ -7,51 +7,72 @@ from PyQt6.QtGui import QPainter, QColor, QPalette, QPainterPath, QBrush, QPen
 
 class ModernProgressBar(QSlider):
     """
-    Ultra-thin progress bar like YouTube Shorts
+    Ultra-thin progress bar like YouTube Shorts with circle handle on hover only
     """
     def __init__(self, parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
-        self.setFixedHeight(4)
+        self.setFixedHeight(14)  # Height to accommodate the handle on hover
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet("""
-            QSlider {
+        self._update_style(hovered=False)
+        
+    def _update_style(self, hovered=False):
+        if hovered:
+            # Show red circle handle on hover
+            handle_style = """
+                QSlider::handle:horizontal {
+                    background: #ff0000;
+                    width: 10px;
+                    height: 10px;
+                    margin: -3px 0;
+                    border-radius: 5px;
+                    border: none;
+                }
+            """
+        else:
+            # Hide handle when not hovering (transparent, no size)
+            handle_style = """
+                QSlider::handle:horizontal {
+                    background: transparent;
+                    width: 0px;
+                    height: 0px;
+                    margin: 0px 0;
+                    border: none;
+                }
+            """
+        
+        self.setStyleSheet(f"""
+            QSlider {{
                 background: transparent;
                 border: none;
-            }
-            QSlider::groove:horizontal {
+            }}
+            QSlider::groove:horizontal {{
                 background: rgba(255, 255, 255, 0.3);
                 height: 4px;
                 border: none;
                 border-radius: 2px;
-            }
-            QSlider::sub-page:horizontal {
+            }}
+            QSlider::sub-page:horizontal {{
                 background: #ff0000;
                 height: 4px;
                 border: none;
                 border-radius: 2px;
-            }
-            QSlider::add-page:horizontal {
+            }}
+            QSlider::add-page:horizontal {{
                 background: rgba(255, 255, 255, 0.3);
                 height: 4px;
                 border: none;
                 border-radius: 2px;
-            }
-            QSlider::handle:horizontal {
-                background: #ff0000;
-                width: 12px;
-                height: 12px;
-                margin: -4px 0;
-                border-radius: 6px;
-                border: 2px solid white;
-            }
-            QSlider::handle:horizontal:hover {
-                background: #ff0000;
-                width: 14px;
-                height: 14px;
-                margin: -5px 0;
-                border-radius: 7px;
-            }
+            }}
+            {handle_style}
         """)
+    
+    def enterEvent(self, event):
+        self._update_style(hovered=True)
+        super().enterEvent(event)
+    
+    def leaveEvent(self, event):
+        self._update_style(hovered=False)
+        super().leaveEvent(event)
 
 
 class RoundedGraphicsView(QGraphicsView):
@@ -103,11 +124,11 @@ class RoundedGraphicsView(QGraphicsView):
         painter.resetTransform()
         
         # Fill corners with window background color
-        painter.fillPath(corners, QBrush(QColor(30, 30, 30)))
+        painter.fillPath(corners, QBrush(QColor(20, 20, 20)))
         
         # Draw border
         # Use the same rect as the mask to ensure curves match perfectly
-        painter.setPen(QPen(QColor(30, 30, 30), 2))
+        painter.setPen(QPen(QColor(20, 20, 20), 2))
         painter.drawRoundedRect(QRectF(view_rect), self.radius, self.radius)
         
         painter.restore()

@@ -1,88 +1,14 @@
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
-    QMessageBox, QFrame, QSizePolicy
+    QMessageBox, QFrame, QSizePolicy, QScrollArea
 )
 from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtGui import QPalette, QColor, QIcon
 from src.ui.input_widget import InputWidget
-from src.ui.results_widget import ResultsWidget
 from src.ui.selection_widget import VideoSelectionWidget
 from src.ui.preview_widget import VideoPreviewWidget
 from src.core.worker import Worker
 import os
-
-class TitleBar(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.parent = parent
-        self.start = QPoint(0, 0)
-        self.pressing = False
-        self.init_ui()
-
-    def init_ui(self):
-        self.setFixedHeight(30)
-        self.setStyleSheet("background-color: #202020; border-bottom: 1px solid #333;")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # Title
-        title_label = QLabel("Shorty")
-        title_label.setStyleSheet("font-weight: bold; color: white; font-size: 14px; padding-left: 10px;")
-        layout.addWidget(title_label)
-
-        layout.addStretch()
-
-        # Window Controls
-        self.min_btn = self.create_btn("-", self.parent.showMinimized)
-        self.max_btn = self.create_btn("□", self.toggle_max)
-        self.close_btn = self.create_btn("✕", self.parent.close, is_close=True)
-
-        layout.addWidget(self.min_btn)
-        layout.addWidget(self.max_btn)
-        layout.addWidget(self.close_btn)
-
-    def create_btn(self, text, callback, is_close=False):
-        btn = QPushButton(text)
-        btn.setFixedSize(45, 30)
-        btn.clicked.connect(callback)
-        bg_hover = "#c42b1c" if is_close else "#444"
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: transparent;
-                color: #aaa;
-                border: none;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background-color: {bg_hover};
-                color: white;
-            }}
-        """)
-        return btn
-
-    def toggle_max(self):
-        if self.parent.isMaximized():
-            self.parent.showNormal()
-        else:
-            self.parent.showMaximized()
-
-    def mousePressEvent(self, event):
-        self.start = self.mapToGlobal(event.pos())
-        self.pressing = True
-
-    def mouseMoveEvent(self, event):
-        if self.pressing and not self.parent.isMaximized():
-            end = self.mapToGlobal(event.pos())
-            movement = end - self.start
-            self.parent.setGeometry(self.parent.x() + movement.x(),
-                                  self.parent.y() + movement.y(),
-                                  self.parent.width(),
-                                  self.parent.height())
-            self.start = end
-
-    def mouseReleaseEvent(self, event):
-        self.pressing = False
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -97,11 +23,40 @@ class MainWindow(QMainWindow):
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
         
+        # Main scroll area for entire page
+        self.main_scroll = QScrollArea()
+        self.main_scroll.setWidgetResizable(True)
+        self.main_scroll.setStyleSheet("""
+            QScrollArea {
+                background-color: rgb(20, 20, 20);
+                border: none;
+            }
+            QScrollBar:vertical {
+                background-color: rgb(20, 20, 20);
+                width: 8px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #444;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        
+        # Scroll content widget
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet("background-color: rgb(20, 20, 20);")
+        
         # Content Layout
-        self.content_layout = QVBoxLayout()
+        self.content_layout = QVBoxLayout(scroll_content)
         self.content_layout.setContentsMargins(20, 20, 20, 20)
         self.content_layout.setSpacing(20)
-        self.main_layout.addLayout(self.content_layout)
+        
+        self.main_scroll.setWidget(scroll_content)
+        self.main_layout.addWidget(self.main_scroll)
 
         # 2. Top Section (Split 50/50)
         top_section = QWidget()
@@ -128,15 +83,16 @@ class MainWindow(QMainWindow):
         top_layout.setStretch(1, 1)
         
         # Fixed height for top section (approx enough for list + scroll)
-        top_section.setFixedHeight(300) 
-        self.content_layout.addWidget(top_section)
+        top_section.setMinimumHeight(250)
+        # top_section.setFixedHeight(300) 
+        self.content_layout.addWidget(top_section, 1)
 
         # 3. Middle Section: Video Player (Centered, 60% width)
         # We use a container to center it
         player_container = QWidget()
         player_layout = QHBoxLayout(player_container)
         player_layout.setContentsMargins(0, 50, 0, 0) # 50px margin top
-        player_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # player_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         self.preview_widget = VideoPreviewWidget()
         
@@ -148,36 +104,34 @@ class MainWindow(QMainWindow):
         self.preview_widget.back_clicked.connect(self.reset_player)
 
         player_layout.addWidget(self.preview_widget)
-        self.content_layout.addWidget(player_container)
+        self.content_layout.addWidget(player_container, 3)
         
         # 4. Bottom Section: Accounts Button
         bottom_layout = QHBoxLayout()
         bottom_layout.addStretch()
         
-        self.accounts_btn = QPushButton("Accounts")
-        self.accounts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.accounts_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #333;
-                color: white;
-                border: 1px solid #555;
-                padding: 8px 20px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #444;
-            }
-        """)
-        self.accounts_btn.clicked.connect(self.open_settings)
-        bottom_layout.addWidget(self.accounts_btn)
-        
+        # self.accounts_btn = QPushButton("Accounts")
+        # self.accounts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # self.accounts_btn.setStyleSheet("""
+        #     QPushButton {
+        #         background-color: #333;
+        #         color: white;
+        #         border: 1px solid #555;
+        #         padding: 8px 20px;
+        #         border-radius: 4px;
+        #     }
+        #     QPushButton:hover {
+        #         background-color: #444;
+        #     }
+        # """)
+        # self.accounts_btn.clicked.connect(self.open_settings)
+        # bottom_layout.addWidget(self.accounts_btn)
+
         self.content_layout.addLayout(bottom_layout)
 
-        # Results Overlay (Hidden by default, or we can use a dialog)
-        self.results_widget = ResultsWidget()
-        self.results_widget.hide() 
-        # For now, we might need to show results in a separate window or replace content.
-        # Given "all on same page", maybe replace the player area?
+        # Dictionary to track active generation workers by clip index
+        # This allows multiple clips to generate simultaneously
+        self.generation_workers = {}
         
 
 
@@ -202,11 +156,35 @@ class MainWindow(QMainWindow):
         # Show loading indicator?
         # Maybe update the preview widget to show "Downloading..."
         self.preview_widget.info_label.setText("Downloading video...")
+        self.current_download_url = url
         
         self.worker = Worker("download_video", url=url)
-        self.worker.finished.connect(self.preview_widget.set_video)
+        self.worker.finished.connect(self.on_download_finished)
+        self.worker.progress.connect(self.update_download_progress)
         self.worker.error.connect(self.on_processing_error)
         self.worker.start()
+
+    def update_download_progress(self, msg):
+        if hasattr(self, 'current_download_url'):
+            # Ignore "Downloading video: URL" messages
+            if "Downloading video:" in msg:
+                self.selection_widget.set_download_progress(self.current_download_url, "Starting download...")
+                return
+                
+            # Parse "Downloading: 50%" to "Downloading... 50%"
+            if "Downloading:" in msg:
+                percent = msg.replace("Downloading:", "").replace("%", "").strip()
+                formatted_msg = f"Downloading... {percent}%"
+                self.selection_widget.set_download_progress(self.current_download_url, formatted_msg)
+            else:
+                # Only show if it looks like progress or status, not URL
+                if "http" not in msg:
+                    self.selection_widget.set_download_progress(self.current_download_url, msg)
+
+    def on_download_finished(self, file_path):
+        if hasattr(self, 'current_download_url'):
+            self.selection_widget.hide_download_progress(self.current_download_url)
+        self.preview_widget.set_video(file_path)
 
     def start_analysis(self, file_path):
         self.worker = Worker("analyze_file", video_path=file_path)
@@ -219,28 +197,59 @@ class MainWindow(QMainWindow):
         self.preview_widget.show_analysis(clips)
 
     def start_generation(self, file_path, selected_clips):
-        # Show generating state
-        self.preview_widget.analysis_status.setText("Generating shorts... Please wait.")
-        self.preview_widget.generate_btn.setEnabled(False)
+        # Support concurrent generation - each clip gets its own worker
+        for clip in selected_clips:
+            clip_index = clip.get("index")
+            
+            # Skip if this clip is already being generated
+            if clip_index in self.generation_workers:
+                continue
+            
+            # Create a worker for this specific clip
+            worker = Worker("generate_clips", video_path=file_path, clips=[clip])
+            
+            # Store reference to the clip in the worker for callbacks
+            worker.generating_clip = clip
+            
+            # Connect signals with lambda to capture clip reference
+            worker.progress.connect(lambda msg, c=clip: self.update_generation_progress(msg, c))
+            worker.finished.connect(lambda paths, c=clip: self.on_generation_finished(paths, c))
+            worker.error.connect(lambda err, c=clip: self.on_generation_error(err, c))
+            
+            # Track the worker
+            self.generation_workers[clip_index] = worker
+            worker.start()
+    
+    def update_generation_progress(self, msg, clip):
+        """Handle generation progress updates for a specific clip."""
+        if msg.startswith("GENERATION_PROGRESS:"):
+            try:
+                percent = int(msg.split(":")[1])
+                # Update the clip card's progress overlay
+                self.preview_widget.update_clip_progress(clip, percent)
+            except (ValueError, IndexError):
+                pass
         
-        self.worker = Worker("generate_clips", video_path=file_path, clips=selected_clips)
-        self.worker.finished.connect(self.on_generation_finished)
-        self.worker.error.connect(self.on_processing_error)
-        self.worker.start()
+    def on_generation_finished(self, paths, clip):
+        """Handle generation completion for a specific clip."""
+        # Remove worker from tracking
+        clip_index = clip.get("index")
+        if clip_index in self.generation_workers:
+            del self.generation_workers[clip_index]
         
-    def on_generation_finished(self, clips):
-        # Show results
-        # Since we want everything on one page, maybe we open the results folder 
-        # or show a "Done" message and list the files in the preview area?
-        # The ResultsWidget logic is: display clips and allow open folder.
-        # Let's show a message box for now or use the ResultsWidget as a popup.
-        self.results_widget.display_clips(clips)
-        self.results_widget.show()
-        self.results_widget.setWindowTitle("Generated Shorts")
-        self.results_widget.resize(600, 400)
+        # Mark the clip as generated with the output path
+        if paths:
+            output_path = paths[0] if isinstance(paths, list) else paths
+            self.preview_widget.mark_clip_generated(clip, output_path)
+    
+    def on_generation_error(self, error_msg, clip):
+        """Handle generation error for a specific clip."""
+        # Remove worker from tracking
+        clip_index = clip.get("index")
+        if clip_index in self.generation_workers:
+            del self.generation_workers[clip_index]
         
-        self.preview_widget.analysis_status.setText("Generation complete!")
-        self.preview_widget.generate_btn.setEnabled(True)
+        QMessageBox.critical(self, "Generation Error", f"Error generating clip:\n{error_msg}")
 
     def reset_player(self):
         # Reset logic if needed
@@ -249,13 +258,14 @@ class MainWindow(QMainWindow):
     def on_processing_error(self, error_msg):
         QMessageBox.critical(self, "Error", f"An error occurred:\n{error_msg}")
         self.preview_widget.set_analyze_busy(False)
+        self.selection_widget.stop_loading()
 
     def open_settings(self):
         QMessageBox.information(self, "Accounts", "Account settings placeholder.\n\nHere you would connect TikTok, YouTube, and Instagram accounts.")
 
     def apply_dark_theme(self):
         palette = QPalette()
-        palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
+        palette.setColor(QPalette.ColorRole.Window, QColor(20, 20, 20))
         palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
         palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
         palette.setColor(QPalette.ColorRole.AlternateBase, QColor(35, 35, 35))
@@ -267,5 +277,5 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
         palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
         palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-        palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(20, 20, 20))
         self.setPalette(palette)
